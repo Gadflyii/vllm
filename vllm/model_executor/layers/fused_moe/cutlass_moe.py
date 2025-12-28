@@ -577,6 +577,7 @@ def run_cutlass_moe_fp4(
     e: int,
     device: torch.device,
     apply_router_weight_on_input: bool = False,
+    expert_map: torch.Tensor | None = None,
 ) -> None:
     """
     MoE implementation for FP4 Inputs
@@ -636,12 +637,21 @@ def run_cutlass_moe_fp4(
     out_dtype = a.dtype
     num_topk = topk_ids.size(1)
 
-    expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
-    blockscale_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
+    # Handle expert_map for tensor parallelism
+    if expert_map is not None:
+        local_topk_ids = expert_map[topk_ids]
+    else:
+        local_topk_ids = topk_ids
+
+    # Use local expert count for allocations
+    local_e = w1_fp4.size(0)
+
+    expert_offsets = torch.empty((local_e + 1), dtype=torch.int32, device=device)
+    blockscale_offsets = torch.empty((local_e + 1), dtype=torch.int32, device=device)
     # Problem size:  (num_experts, (m,2n,k))
-    problem_sizes1 = torch.empty((e, 3), dtype=torch.int32, device=device)
+    problem_sizes1 = torch.empty((local_e, 3), dtype=torch.int32, device=device)
     # Problem size:  (num_experts, (m,n,k))
-    problem_sizes2 = torch.empty((e, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((local_e, 3), dtype=torch.int32, device=device)
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -656,13 +666,13 @@ def run_cutlass_moe_fp4(
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
     ops.get_cutlass_moe_mm_data(
-        topk_ids,
+        local_topk_ids,
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
         a_map,
         c_map,
-        e,
+        local_e,
         n,
         k,
         blockscale_offsets,
@@ -755,7 +765,7 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
             )
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def supports_chunking(self) -> bool:
         return True
@@ -831,6 +841,7 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
             e=e,
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_map=expert_map,
         )
 
 
@@ -848,12 +859,6 @@ def cutlass_moe_fp4(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
-    assert expert_map is None, (
-        "Expert Parallelism / expert_map "
-        "is currently not supported for "
-        "ModelOptNvFp4FusedMoE's cutlass_moe_fp4."
-    )
-
     # TODO(bnell): this feels a bit hacky
     # NVFP4 requires two levels of quantization, which involves
     # computing some scaling factors dynamically. This makes it
@@ -891,7 +896,7 @@ def cutlass_moe_fp4(
         inplace=False,
         activation="silu",
         global_num_experts=e,
-        expert_map=None,
+        expert_map=expert_map,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
 

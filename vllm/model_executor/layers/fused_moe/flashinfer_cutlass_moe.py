@@ -85,7 +85,7 @@ class FlashInferExperts(mk.FusedMoEPermuteExpertsUnpermute):
         )
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def supports_chunking(self) -> bool:
         # This refers to TP chunking; DP chunking is handled separately.
