@@ -120,6 +120,27 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
         device_capability = current_platform.get_device_capability()
+
+        # SM120+ (Blackwell) P2P requires iommu=pt kernel parameter
+        # Consumer RTX 50-series does not support P2P at all
+        # Professional RTX PRO 6000 supports P2P with correct IOMMU config
+        # See: https://github.com/NVIDIA/cuda-samples/issues/390
+        if device_capability is not None and device_capability.major >= 12:
+            if envs.VLLM_SKIP_P2P_CHECK:
+                logger.info(
+                    "SM%d0 (Blackwell) detected but VLLM_SKIP_P2P_CHECK=1, "
+                    "attempting custom allreduce. Ensure iommu=pt is set.",
+                    device_capability.major,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled on SM%d0+ (Blackwell) due to "
+                    "P2P/IOMMU issues. Set VLLM_SKIP_P2P_CHECK=1 to override "
+                    "if you have configured iommu=pt. Using NCCL instead.",
+                    device_capability.major,
+                )
+                return
+
         if (
             current_platform.is_cuda()
             and symm_mem_enabled
