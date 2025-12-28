@@ -28,6 +28,94 @@ except Exception:
 
 logger = init_logger(__name__)
 
+# GPU name indicators for classification
+_PROFESSIONAL_GPU_INDICATORS = (
+    'pro',      # RTX PRO series
+    'quadro',   # Legacy Quadro
+    'rtx a',    # RTX A series (A4000, A5000, A6000)
+    'l40',      # L40/L40S
+    'a100',     # A100
+    'h100',     # H100
+    'h200',     # H200
+    'b100',     # B100
+    'b200',     # B200
+    'tesla',    # Tesla series
+)
+
+_CONSUMER_GPU_INDICATORS = (
+    'geforce',  # GeForce series
+    'rtx 50',   # RTX 5000 consumer series
+    'rtx 40',   # RTX 4000 consumer series
+    'rtx 30',   # RTX 3000 consumer series
+    'rtx 20',   # RTX 2000 consumer series
+    'titan',    # Titan series
+)
+
+
+def _check_sm120_p2p_support(device: torch.device) -> tuple[bool, str]:
+    """
+    Check if P2P should be enabled for SM120+ (Blackwell) GPUs.
+
+    SM120 P2P support varies by GPU type and system configuration:
+    - Consumer GPUs (GeForce RTX 50xx): P2P not supported by hardware
+    - Professional GPUs (RTX PRO): P2P supported with iommu=pt kernel param
+
+    Args:
+        device: The CUDA device to check
+
+    Returns:
+        (should_enable, reason): Whether to enable custom allreduce and why
+    """
+    props = torch.cuda.get_device_properties(device)
+    gpu_name = props.name.lower()
+
+    # Check GPU type
+    is_professional = any(ind in gpu_name for ind in _PROFESSIONAL_GPU_INDICATORS)
+    is_consumer = any(ind in gpu_name for ind in _CONSUMER_GPU_INDICATORS)
+
+    if is_consumer:
+        return False, (
+            f"Consumer GPU '{props.name}' does not support P2P on SM120. "
+            "This is a hardware limitation, not a configuration issue."
+        )
+
+    if not is_professional:
+        # Unknown GPU type - be conservative
+        return False, (
+            f"Unknown GPU type '{props.name}' on SM120. "
+            "Set VLLM_SKIP_P2P_CHECK=1 to force enable if P2P is known to work."
+        )
+
+    # Professional GPU - check IOMMU configuration
+    try:
+        with open('/proc/cmdline', 'r') as f:
+            cmdline = f.read()
+    except (OSError, IOError):
+        # Can't read cmdline (e.g., containerized environment)
+        # Be conservative but allow override
+        return False, (
+            f"Professional GPU '{props.name}' detected but cannot read "
+            "/proc/cmdline to verify IOMMU config. "
+            "Set VLLM_SKIP_P2P_CHECK=1 to force enable."
+        )
+
+    # Check for P2P-safe IOMMU configurations
+    has_iommu_pt = 'iommu=pt' in cmdline
+    has_iommu_off = 'iommu=off' in cmdline
+
+    if has_iommu_pt or has_iommu_off:
+        return True, (
+            f"Professional GPU '{props.name}' with P2P-safe IOMMU config detected."
+        )
+
+    # Professional GPU but IOMMU not in passthrough mode
+    return False, (
+        f"Professional GPU '{props.name}' detected but IOMMU passthrough "
+        "not enabled. P2P will fail silently without 'iommu=pt' kernel param. "
+        "Add 'iommu=pt' to GRUB_CMDLINE_LINUX_DEFAULT and reboot, "
+        "or set VLLM_SKIP_P2P_CHECK=1 to force enable."
+    )
+
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
@@ -121,25 +209,32 @@ class CustomAllreduce:
         self.device = device
         device_capability = current_platform.get_device_capability()
 
-        # SM120+ (Blackwell) P2P requires iommu=pt kernel parameter
-        # Consumer RTX 50-series does not support P2P at all
-        # Professional RTX PRO 6000 supports P2P with correct IOMMU config
+        # SM120+ (Blackwell) P2P support varies by GPU type and IOMMU config
         # See: https://github.com/NVIDIA/cuda-samples/issues/390
         if device_capability is not None and device_capability.major >= 12:
             if envs.VLLM_SKIP_P2P_CHECK:
+                # User explicitly requested to skip P2P check
                 logger.info(
-                    "SM%d0 (Blackwell) detected but VLLM_SKIP_P2P_CHECK=1, "
-                    "attempting custom allreduce. Ensure iommu=pt is set.",
+                    "SM%d0 (Blackwell) detected with VLLM_SKIP_P2P_CHECK=1, "
+                    "forcing custom allreduce. Ensure P2P is properly configured.",
                     device_capability.major,
                 )
             else:
-                logger.warning(
-                    "Custom allreduce is disabled on SM%d0+ (Blackwell) due to "
-                    "P2P/IOMMU issues. Set VLLM_SKIP_P2P_CHECK=1 to override "
-                    "if you have configured iommu=pt. Using NCCL instead.",
-                    device_capability.major,
-                )
-                return
+                # Smart detection based on GPU type and IOMMU config
+                should_enable, reason = _check_sm120_p2p_support(device)
+                if should_enable:
+                    logger.info(
+                        "SM%d0 (Blackwell) P2P enabled: %s",
+                        device_capability.major,
+                        reason,
+                    )
+                else:
+                    logger.warning(
+                        "Custom allreduce disabled on SM%d0 (Blackwell): %s",
+                        device_capability.major,
+                        reason,
+                    )
+                    return
 
         if (
             current_platform.is_cuda()
