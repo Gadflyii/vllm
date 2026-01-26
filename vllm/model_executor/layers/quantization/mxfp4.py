@@ -110,6 +110,11 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         return get_mxfp4_backend_with_lora()
 
     if current_platform.is_cuda():
+        # Allow forcing Marlin backend even when FlashInfer is available
+        if envs.VLLM_MXFP4_USE_MARLIN:
+            logger.info_once("Using Marlin backend (forced via VLLM_MXFP4_USE_MARLIN)")
+            return Mxfp4Backend.MARLIN
+
         if (
             current_platform.is_device_capability(90)
             and has_flashinfer()
