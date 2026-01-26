@@ -68,6 +68,7 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -264,7 +265,7 @@ class Glm4MoeLiteModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -316,7 +317,122 @@ class Glm4MoeLiteModel(nn.Module):
             num_experts=self.config.n_routed_experts,
         )
 
+    def _load_weights_mxfp4(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Load weights for native MXFP4 format with fused expert tensors."""
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        # MLP stacked params for non-expert layers
+        stacked_params_mapping = [
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # MLA params
+        mla_params_mapping = [
+            ("fused_qkv_a_proj", "q_a_proj", 0),
+            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+        ]
+        stacked_params_mapping.extend(mla_params_mapping)
+
+        num_experts = self.config.n_routed_experts
+        intermediate_size = self.config.moe_intermediate_size
+
+        for name, weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if spec_layer is not None:
+                continue
+
+            # Handle fused MXFP4 expert weights (w13_weight, w2_weight, etc.)
+            if ".experts.w13_weight" in name:
+                # gate_up_proj fused weights: [num_experts, 2*intermediate, hidden/2]
+                # Reshape from 4D block format if needed
+                if weight.dim() == 4:
+                    weight = weight.view(num_experts, 2 * intermediate_size, -1)
+                param = params_dict[name]
+                dim1, dim2 = weight.shape[1], weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(weight)
+                loaded_params.add(name)
+                continue
+            elif ".experts.w2_weight" in name:
+                # down_proj weights: [num_experts, hidden, intermediate/2]
+                if weight.dim() == 4:
+                    weight = weight.view(num_experts, -1, intermediate_size // 2)
+                param = params_dict[name]
+                dim1, dim2 = weight.shape[1], weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(weight)
+                loaded_params.add(name)
+                continue
+            elif ".experts.w13_weight_scale" in name:
+                # gate_up_proj scales: [num_experts, 2*intermediate, hidden/32]
+                param = params_dict[name]
+                dim1, dim2 = weight.shape[1], weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(weight)
+                loaded_params.add(name)
+                continue
+            elif ".experts.w2_weight_scale" in name:
+                # down_proj scales
+                param = params_dict[name]
+                dim1, dim2 = weight.shape[1], weight.shape[2]
+                param.data[:, :dim1, :dim2].copy_(weight)
+                loaded_params.add(name)
+                continue
+            elif ".experts.w13_bias" in name or ".experts.w2_bias" in name:
+                # bias tensors: [num_experts, size]
+                param = params_dict[name]
+                dim1 = weight.shape[1]
+                param.data[:, :dim1].copy_(weight)
+                loaded_params.add(name)
+                continue
+
+            # Handle stacked params (non-expert layers)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts." in name:
+                    continue
+                name_mapped = name.replace(weight_name, param_name)
+                if param_name == "fused_qkv_a_proj" and name_mapped not in params_dict:
+                    continue
+                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name_mapped, self):
+                    continue
+                param = params_dict[name_mapped]
+                weight_loader = param.weight_loader
+                weight_loader(param, weight, shard_id)
+                loaded_params.add(name_mapped)
+                break
+            else:
+                # Default loading for other weights
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
+                loaded_params.add(name)
+
+        return loaded_params
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Check if this is native MXFP4 format (fused expert weights)
+        quant_config = getattr(self, 'quant_config', None)
+        if (quant_config is not None and
+                hasattr(quant_config, 'get_name') and
+                quant_config.get_name() == "mxfp4"):
+            return self._load_weights_mxfp4(weights)
+
         rocm_aiter_moe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         )
@@ -515,9 +631,25 @@ class Glm4MoeLiteModel(nn.Module):
 class Glm4MoeLiteForCausalLM(
     nn.Module, SupportsPP, SupportsLoRA, Glm4LiteMixtureOfExperts
 ):
+    # For native MXFP4 format (like GPT-OSS), experts are fused in checkpoint
+    is_3d_moe_weight: bool = True
+
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    # Weight mapper for native MXFP4 format (GPT-OSS compatible)
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            # MoE MXFP4 weights
+            ".gate_up_proj_blocks": ".w13_weight",
+            ".down_proj_blocks": ".w2_weight",
+            ".gate_up_proj_scales": ".w13_weight_scale",
+            ".down_proj_scales": ".w2_weight_scale",
+            ".gate_up_proj_bias": ".w13_bias",
+            ".down_proj_bias": ".w2_bias",
+        },
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -596,7 +728,7 @@ class Glm4MoeLiteForCausalLM(
 
     def forward(
         self,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -625,8 +757,188 @@ class Glm4MoeLiteForCausalLM(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # For native MXFP4 format, use custom loading instead of AutoWeightsLoader
+        if (self.quant_config is not None and
+                hasattr(self.quant_config, 'get_name') and
+                self.quant_config.get_name() == "mxfp4"):
+            return self._load_weights_mxfp4_top_level(weights)
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def _load_weights_mxfp4_top_level(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Load weights for native MXFP4 format with fused expert tensors."""
+        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        num_experts = self.config.n_routed_experts
+        intermediate_size = self.config.moe_intermediate_size
+        hidden_size = self.config.hidden_size
+
+        # Get TP rank and world size for sharding
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        # MLP stacked params for non-expert layers
+        stacked_params_mapping = [
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        mla_params_mapping = [
+            ("fused_qkv_a_proj", "q_a_proj", 0),
+            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+        ]
+        stacked_params_mapping.extend(mla_params_mapping)
+
+        for name, weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if spec_layer is not None:
+                continue
+
+            # Handle fused MXFP4 expert weights (w13_weight, w2_weight, etc.)
+            # With TP, we need to shard the weights appropriately
+            if ".experts.w13_weight" in name and "scale" not in name:
+                # gate_up_proj fused weights: [num_experts, 2*intermediate, hidden/2]
+                # Flatten from 4D if needed
+                if weight.dim() == 4:
+                    weight = weight.view(
+                        num_experts, 2 * intermediate_size, -1
+                    ).contiguous()
+                # Shard dim 1 (intermediate) by TP
+                if tp_size > 1:
+                    # Each interleaved pair (gate[i], up[i]) goes to same TP rank
+                    # Split into 2*intermediate_size // tp_size per rank
+                    shard_size = 2 * intermediate_size // tp_size
+                    weight = weight[:, tp_rank * shard_size:(tp_rank + 1) * shard_size, :].contiguous()
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+            elif ".experts.w2_weight" in name and "scale" not in name:
+                # down_proj weights: [num_experts, hidden, intermediate/2]
+                if weight.dim() == 4:
+                    weight = weight.view(
+                        num_experts, -1, intermediate_size // 2
+                    ).contiguous()
+                # Shard dim 2 (intermediate//2) by TP
+                if tp_size > 1:
+                    shard_size = (intermediate_size // 2) // tp_size
+                    weight = weight[:, :, tp_rank * shard_size:(tp_rank + 1) * shard_size].contiguous()
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+            elif ".experts.w13_weight_scale" in name:
+                # Scales: [num_experts, 2*intermediate, hidden/32]
+                # Shard dim 1 by TP
+                if tp_size > 1:
+                    shard_size = 2 * intermediate_size // tp_size
+                    weight = weight[:, tp_rank * shard_size:(tp_rank + 1) * shard_size, :].contiguous()
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+            elif ".experts.w2_weight_scale" in name:
+                # Scales: [num_experts, hidden, intermediate/32]
+                # Shard dim 2 by TP
+                if tp_size > 1:
+                    shard_size = (intermediate_size // 32) // tp_size
+                    weight = weight[:, :, tp_rank * shard_size:(tp_rank + 1) * shard_size].contiguous()
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+            elif ".experts.w13_bias" in name:
+                # Bias: [num_experts, 2*intermediate]
+                # Shard dim 1 by TP
+                if tp_size > 1:
+                    shard_size = 2 * intermediate_size // tp_size
+                    weight = weight[:, tp_rank * shard_size:(tp_rank + 1) * shard_size].contiguous()
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+            elif ".experts.w2_bias" in name:
+                # Bias: [num_experts, hidden] - no TP sharding needed for down_proj output
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param, weight,
+                        weight_name=name, shard_id=None, expert_id=None
+                    )
+                    loaded_params.add(name)
+                continue
+
+            # Handle stacked params (non-expert layers)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts." in name:
+                    continue
+                name_mapped = name.replace(weight_name, param_name)
+                if param_name == "fused_qkv_a_proj" and name_mapped not in params_dict:
+                    continue
+                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name_mapped, self):
+                    continue
+                if name_mapped not in params_dict:
+                    continue
+                param = params_dict[name_mapped]
+                weight_loader = param.weight_loader
+                weight_loader(param, weight, shard_id)
+                loaded_params.add(name_mapped)
+                break
+            else:
+                # Default loading for other weights
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped_name is None:
+                    continue
+                name = remapped_name
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight)
+                loaded_params.add(name)
+
+        return loaded_params
 
 
 def get_spec_layer_idx_from_weight_name(
